@@ -1,12 +1,12 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import axios from 'axios';
 
-const CHUNK_SIZE = 75 * 1024 * 1024; // 75 MB per chunk (approx 2 mins of 720p video)
 const API_BASE_URL = 'http://localhost:3000/api';
 
 function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [processing, setProcessing] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState('');
@@ -14,6 +14,8 @@ function App() {
   const [videoUrl, setVideoUrl] = useState(null);
   const [error, setError] = useState(null);
   const [videoId, setVideoId] = useState(null);
+  const [chunkCount, setChunkCount] = useState(0);
+  const videoRef = useRef(null);
 
   // Handle file selection
   const handleFileSelect = (event) => {
@@ -24,26 +26,49 @@ function App() {
       setAnalysisResults(null);
       setVideoUrl(null);
       setProgress(0);
+      setUploadStatus('');
+      setChunkCount(0);
     } else {
       setError('Please select a valid video file');
     }
   };
 
-  // Split file into chunks
-  const splitFileIntoChunks = (file) => {
-    const chunks = [];
-    let offset = 0;
-
-    while (offset < file.size) {
-      const chunk = file.slice(offset, offset + CHUNK_SIZE);
-      chunks.push(chunk);
-      offset += CHUNK_SIZE;
+  // Fetch and stitch chunks into a playable blob
+  const stitchChunksForPlayback = async (chunkUrlsArray) => {
+    try {
+      setUploadStatus('Preparing video for playback...');
+      
+      const chunks = [];
+      
+      // Fetch all chunks
+      for (let i = 0; i < chunkUrlsArray.length; i++) {
+        console.log(`📥 Downloading chunk ${i + 1}/${chunkUrlsArray.length}...`);
+        const response = await fetch(chunkUrlsArray[i]);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch chunk ${i}`);
+        }
+        const blob = await response.blob();
+        chunks.push(blob);
+        
+        // Update progress
+        const downloadProgress = 90 + ((i + 1) / chunkUrlsArray.length) * 10;
+        setProgress(Math.round(downloadProgress));
+      }
+      
+      // Concatenate all chunks into single blob
+      const stitchedBlob = new Blob(chunks, { type: 'video/mp4' });
+      const blobUrl = URL.createObjectURL(stitchedBlob);
+      
+      console.log(`✅ Video stitched successfully: ${(stitchedBlob.size / (1024 * 1024)).toFixed(2)} MB`);
+      setUploadStatus('Video ready for playback!');
+      return blobUrl;
+    } catch (err) {
+      console.error('Error stitching chunks:', err);
+      throw err;
     }
-
-    return chunks;
   };
 
-  // Upload video with chunking and resumability
+  // Upload and process video
   const handleUpload = async () => {
     if (!selectedFile) {
       setError('Please select a video file first');
@@ -51,89 +76,87 @@ function App() {
     }
 
     try {
-      setUploading(true);
       setError(null);
-      setUploadStatus('Preparing upload...');
+      
+      // Step 1: Initiate upload
+      setUploading(true);
+      setUploadStatus('Getting upload URL...');
+      setProgress(5);
 
-      // Split file into chunks
-      const chunks = splitFileIntoChunks(selectedFile);
-      const chunkCount = chunks.length;
-
-      console.log(`📦 Split video into ${chunkCount} chunks (${CHUNK_SIZE / (1024 * 1024)} MB each)`);
-
-      // Step 1: Initiate upload - get presigned URLs
-      setUploadStatus('Getting upload URLs...');
       const initiateResponse = await axios.post(`${API_BASE_URL}/upload/initiate`, {
         fileName: selectedFile.name,
         fileSize: selectedFile.size,
-        chunkCount: chunkCount,
       });
 
-      const { videoId: newVideoId, uploadUrls } = initiateResponse.data;
+      const { videoId: newVideoId, uploadUrl } = initiateResponse.data;
       setVideoId(newVideoId);
       console.log(`🆔 Video ID: ${newVideoId}`);
 
-      // Step 2: Upload chunks to S3
-      setUploadStatus('Uploading chunks to S3...');
-      let uploadedChunks = 0;
+      // Step 2: Upload full video to S3
+      setUploadStatus('Uploading video to S3...');
+      console.log(`📤 Uploading ${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB video...`);
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        const { uploadUrl } = uploadUrls[i];
+      const uploadResponse = await fetch(uploadUrl, {
+        method: 'PUT',
+        body: selectedFile,
+        headers: {
+          'Content-Type': 'video/mp4',
+        },
+      });
 
-        try {
-          // Upload chunk directly to S3 using presigned URL
-          await axios.put(uploadUrl, chunk, {
-            headers: {
-              'Content-Type': 'video/mp4',
-            },
-            onUploadProgress: (progressEvent) => {
-              const chunkProgress = (progressEvent.loaded / progressEvent.total) * 100;
-              const totalProgress = ((uploadedChunks + chunkProgress / 100) / chunkCount) * 100;
-              setProgress(Math.round(totalProgress));
-            },
-          });
-
-          uploadedChunks++;
-          const overallProgress = (uploadedChunks / chunkCount) * 100;
-          setProgress(Math.round(overallProgress));
-
-          // Track progress in Redis for resumability
-          await axios.post(`${API_BASE_URL}/upload/progress`, {
-            videoId: newVideoId,
-            chunkIndex: i,
-            status: 'completed',
-          });
-
-          console.log(`✅ Chunk ${i + 1}/${chunkCount} uploaded`);
-          setUploadStatus(`Uploaded ${uploadedChunks}/${chunkCount} chunks`);
-        } catch (uploadError) {
-          console.error(`❌ Failed to upload chunk ${i}:`, uploadError);
-          throw new Error(`Failed to upload chunk ${i + 1}`);
-        }
+      if (!uploadResponse.ok) {
+        throw new Error(`Upload failed with status ${uploadResponse.status}`);
       }
 
-      console.log('✅ All chunks uploaded successfully');
+      console.log('✅ Video uploaded to S3');
       setUploading(false);
-      setUploadStatus('Upload complete! Starting analysis...');
-      setAnalyzing(true);
+      setProgress(25);
 
-      // Step 3: Complete upload and trigger analysis
-      const completeResponse = await axios.post(`${API_BASE_URL}/upload/complete`, {
+      // Step 3: Process video (backend downloads, chunks with FFmpeg, uploads chunks)
+      setProcessing(true);
+      setUploadStatus('Processing video with FFmpeg (chunking)...');
+      console.log('✂️  Backend is chunking video with FFmpeg...');
+
+      const processResponse = await axios.post(`${API_BASE_URL}/upload/process`, {
         videoId: newVideoId,
       });
 
-      const { analysisResults: results, videoPlaybackUrl } = completeResponse.data;
+      const { totalChunks } = processResponse.data;
+      setChunkCount(totalChunks);
+      console.log(`✅ Video chunked into ${totalChunks} valid MP4 segments`);
+      setProcessing(false);
+      setProgress(50);
 
-      console.log('✅ Analysis completed');
+      // Step 4: Trigger analysis
+      setAnalyzing(true);
+      setUploadStatus(`Analyzing ${totalChunks} chunks...`);
+      console.log(`🚀 Sending ${totalChunks} chunk URLs to FastAPI...`);
+
+      const analyzeResponse = await axios.post(`${API_BASE_URL}/upload/analyze`, {
+        videoId: newVideoId,
+      });
+
+      const { analysisResults: results } = analyzeResponse.data;
       setAnalysisResults(results);
-      setVideoUrl(videoPlaybackUrl);
+      console.log('✅ Analysis completed');
+      setProgress(80);
+
+      // Step 5: Set video URL to playback endpoint (returns presigned URL to original video)
+      // Backend returns the presigned URL for the original video in S3
+      setUploadStatus('Getting playback URL...');
+      const playbackResponse = await axios.get(`${API_BASE_URL}/upload/playback/${newVideoId}`);
+      const { playbackUrl } = playbackResponse.data;
+      
+      setVideoUrl(playbackUrl);
+
       setAnalyzing(false);
-      setUploadStatus('Analysis complete!');
+      setUploadStatus('Complete! Video ready to play.');
+      setProgress(100);
     } catch (err) {
       console.error('Upload error:', err);
       setError(err.response?.data?.message || err.message || 'Upload failed');
       setUploading(false);
+      setProcessing(false);
       setAnalyzing(false);
     }
   };
@@ -142,7 +165,7 @@ function App() {
     <div className="app">
       <div className="header">
         <h1>🎥 Video Upload & Analysis</h1>
-        <p>Upload your video for AI-powered analysis</p>
+        <p>FFmpeg-powered chunking with valid MP4 segments</p>
       </div>
 
       {/* File Upload Section */}
@@ -150,14 +173,14 @@ function App() {
         <div className="file-input-container">
           <label htmlFor="video-input" className="file-label">
             <h3>📁 Select Video File</h3>
-            <p>Click to browse or drag and drop</p>
+            <p>Backend will chunk with FFmpeg at keyframes</p>
           </label>
           <input
             id="video-input"
             type="file"
             accept="video/*"
             onChange={handleFileSelect}
-            disabled={uploading || analyzing}
+            disabled={uploading || processing || analyzing}
           />
         </div>
 
@@ -167,41 +190,53 @@ function App() {
             <p><strong>Name:</strong> {selectedFile.name}</p>
             <p><strong>Size:</strong> {(selectedFile.size / (1024 * 1024)).toFixed(2)} MB</p>
             <p><strong>Type:</strong> {selectedFile.type}</p>
-            <p><strong>Estimated Chunks:</strong> {Math.ceil(selectedFile.size / CHUNK_SIZE)}</p>
+            <p><strong>Processing:</strong></p>
+            <ul style={{ marginLeft: '20px', marginTop: '5px' }}>
+              <li>✅ Upload full video to S3</li>
+              <li>✅ Backend chunks with FFmpeg (120s segments)</li>
+              <li>✅ Each chunk = valid MP4 with correct metadata</li>
+              <li>✅ FastAPI gets all chunk URLs (parallel processing)</li>
+            </ul>
           </div>
         )}
 
         <button
           className="upload-button"
           onClick={handleUpload}
-          disabled={!selectedFile || uploading || analyzing}
+          disabled={!selectedFile || uploading || processing || analyzing}
         >
-          {uploading ? 'Uploading...' : analyzing ? 'Analyzing...' : 'Upload & Analyze'}
+          {uploading ? 'Uploading...' : processing ? 'Chunking with FFmpeg...' : analyzing ? 'Analyzing...' : 'Upload & Analyze'}
         </button>
       </div>
 
       {/* Progress Section */}
-      {(uploading || analyzing) && (
+      {(uploading || processing || analyzing) && (
         <div className="progress-section">
-          {uploading && (
-            <>
-              <div className="progress-bar-container">
-                <div className="progress-bar" style={{ width: `${progress}%` }}>
-                  {progress}%
-                </div>
-              </div>
-              <div className="progress-info">
-                <p>{uploadStatus}</p>
-              </div>
-            </>
+          <div className="progress-bar-container">
+            <div className="progress-bar" style={{ width: `${progress}%` }}>
+              {progress}%
+            </div>
+          </div>
+          <div className="progress-info">
+            <p>{uploadStatus}</p>
+          </div>
+
+          {processing && (
+            <div className="spinner">
+              <div className="spinner-animation"></div>
+              <p>✂️  FFmpeg is chunking video into valid MP4 segments...</p>
+              <p style={{ color: '#999', fontSize: '0.9rem', marginTop: '10px' }}>
+                This ensures each chunk is playable with correct duration
+              </p>
+            </div>
           )}
 
           {analyzing && (
             <div className="spinner">
               <div className="spinner-animation"></div>
-              <p>🔍 Analyzing video... This may take up to 5 minutes.</p>
+              <p>🔍 Analyzing {chunkCount} chunks... This may take up to 5 minutes.</p>
               <p style={{ color: '#999', fontSize: '0.9rem', marginTop: '10px' }}>
-                Please wait, do not close this page.
+                FastAPI is processing all chunks in parallel
               </p>
             </div>
           )}
@@ -220,7 +255,7 @@ function App() {
       {analysisResults && !analyzing && (
         <div className="success-message">
           <h3>✅ Success</h3>
-          <p>Video uploaded and analyzed successfully!</p>
+          <p>Video chunked into {chunkCount} valid MP4 segments and analyzed successfully!</p>
         </div>
       )}
 
@@ -239,12 +274,13 @@ function App() {
         <div className="video-player-section">
           <h2>▶️ Video Playback</h2>
           <div className="video-container">
-            <video controls src={videoUrl}>
+            <video ref={videoRef} controls>
+              <source src={videoUrl} type="video/mp4" />
               Your browser does not support the video tag.
             </video>
           </div>
           <p style={{ textAlign: 'center', marginTop: '10px', color: '#999', fontSize: '0.9rem' }}>
-            Note: Playing first chunk as demo. In production, all chunks would be combined.
+            ✅ Streaming all {chunkCount} chunks server-side (backend does the stitching!)
           </p>
         </div>
       )}

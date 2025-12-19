@@ -1,23 +1,31 @@
 import express from 'express';
 import {
   initiateUpload,
-  trackProgress,
+  processVideo,
+  analyzeVideo,
+  getChunks,
   getUploadStatus,
-  completeUpload,
+  streamVideo,
 } from '../controllers/uploadController.js';
 
 const router = express.Router();
 
-// Initiate upload - get presigned URLs
+// Step 1: Initiate upload - get presigned URL for full video upload
 router.post('/initiate', initiateUpload);
 
-// Track chunk upload progress
-router.post('/progress', trackProgress);
+// Step 2: Process video - download, chunk with FFmpeg, upload chunks
+router.post('/process', processVideo);
 
-// Get upload status (for resumability)
+// Step 3: Analyze video - send chunk URLs to FastAPI
+router.post('/analyze', analyzeVideo);
+
+// Get chunk URLs for playback
+router.get('/chunks/:videoId', getChunks);
+
+// Get upload status
 router.get('/status/:videoId', getUploadStatus);
 
-// Complete upload and trigger analysis
-router.post('/complete', completeUpload);
+// Stream video - server-side stitching (recommended for playback)
+router.get('/playback/:videoId', streamVideo);
 
 export default router;
